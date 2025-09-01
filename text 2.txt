@@ -1,0 +1,336 @@
+```python
+# elveirdor_toolkit.py
+#
+# Elveirdor Toolkit
+# -----------------
+# All-in-one Python utility that
+#   A) Implements encoder / decoder for    – English A1Z26
+#                                           – Elveirdor Ichthys cipher
+#   B) Extracts text from a .docx file (no third-party requirements)
+#   C) Splits raw text into very simple sections (heading + body)
+#   D) Searches for numeric strings inside the text and tries to decode
+#      them with both ciphers, producing JSON / CSV artefacts.
+#
+# Library usage
+# -------------
+# from elveirdor_toolkit import *
+# text      = docxToText("/path/to/file.docx")
+# sections  = splitSections(text)
+# findings  = decodeAllNumericSequences(text)
+#
+# CLI usage
+# ---------
+# python elveirdor_toolkit.py "/path/to/file.docx"
+#
+# Output files (relative to CWD)
+# ------------------------------
+# elveirdor_outputs/decoded_sequences.json
+# elveirdor_outputs/decoded_sequences.csv
+# elveirdor_outputs/sections.json
+#
+# --------------------------------------------------------------------
+
+from __future__ import annotations
+
+import csv
+import json
+import re
+import sys
+import zipfile
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+# --------------------
+#  Cipher – A1Z26
+# --------------------
+ENG_L2N: Dict[str, int] = {chr(ord('A') + i): i + 1 for i in range(26)}
+ENG_N2L: Dict[int, str] = {v: k for k, v in ENG_L2N.items()}
+
+
+def encodeEnglishA1Z26(text: str) -> List[int]:
+    """Encode text to A1Z26 (A=1 … Z=26). Non-letters are ignored."""
+    return [ENG_L2N[ch] for ch in text.upper() if ch.isalpha()]
+
+
+def decodeEnglishA1Z26Concat(numString: str) -> Optional[str]:
+    """
+    Decode a run-together digit string (e.g. “3118181520”) via A1Z26.
+    Back-tracking is used to resolve ambiguities.
+    Returns None on failure.
+    """
+    digits = numString.strip()
+    if not digits.isdigit():
+        return None
+
+    memo: Dict[int, Optional[str]] = {}
+
+    def dfs(i: int) -> Optional[str]:
+        if i == len(digits):
+            return ""
+        if i in memo:
+            return memo[i]
+
+        for length in (2, 1):                                                   # try 2-digit first
+            if i + length <= len(digits):
+                value = int(digits[i:i + length])
+                if 1 <= value <= 26:
+                    rest = dfs(i + length)
+                    if rest is not None:
+                        memo[i] = ENG_N2L[value] + rest
+                        return memo[i]
+
+        memo[i] = None
+        return None
+
+    return dfs(0)
+
+
+# -----------------------------
+#  Cipher – Elveirdor Ichthys
+# -----------------------------
+# Digraph tokens
+ELV_TOKENS: List[Tuple[str, int]] = [
+    ("CH", 4),
+    ("CK", 5),
+    ("LL", 16),
+    ("PH", 21),
+    ("ST", 25),
+    ("TH", 27),
+    ("WH", 31),
+]
+
+# Single symbols
+ELV_L2N: Dict[str, int] = {
+    "A": 1,  "B": 2,  "C": 3,
+    "D": 6,  "E": 7,  "EE": 8,
+    "F": 9,  "G": 10, "H": 11, "I": 12, "J": 13, "K": 14, "L": 15,
+    "M": 17, "N": 18, "O": 19, "P": 20,
+    "Q": 22, "R": 23, "S": 24,
+    "T": 26,
+    "U": 28, "V": 29, "W": 30,
+    "X": 32, "Y": 33, "Z": 34,
+}
+
+# Build helpers
+_ELV_TOKEN_ORDER: List[str] = [tok for tok, _ in ELV_TOKENS] + list(ELV_L2N.keys())
+_ELV_TOKEN_ORDER.sort(key=len, reverse=True)                                   # longest first
+
+ELV_N2SYM: Dict[int, str] = {num: sym for sym, num in (ELV_TOKENS + list(ELV_L2N.items()))}
+
+
+def _tokenizeElvText(text: str) -> List[str]:
+    """Return list of Elveirdor tokens for encoding (digraphs preferred)."""
+    s = re.sub(r"[^A-Za-z]", "", text.upper())
+    tokens: List[str] = []
+
+    i = 0
+    while i < len(s):
+        for tok in _ELV_TOKEN_ORDER:
+            if s.startswith(tok, i):
+                tokens.append(tok)
+                i += len(tok)
+                break
+        else:                                                                  # no token matched
+            i += 1                                                             # drop unknown char
+    return tokens
+
+
+def encodeElveirdor(text: str) -> List[int]:
+    """Encode plaintext to Elveirdor codes."""
+    out: List[int] = []
+    for tok in _tokenizeElvText(text):
+        if tok in ELV_L2N:
+            out.append(ELV_L2N[tok])
+        else:                                                                  # digraph
+            out.append(dict(ELV_TOKENS)[tok])
+    return out
+
+
+def decodeElveirdorConcat(numString: str) -> Optional[str]:
+    """Decode concatenated number string (1…34) using Elveirdor cipher."""
+    digits = numString.strip()
+    if not digits.isdigit():
+        return None
+
+    memo: Dict[int, Optional[List[str]]] = {}
+
+    def dfs(i: int) -> Optional[List[str]]:
+        if i == len(digits):
+            return []
+        if i in memo:
+            return memo[i]
+
+        for length in (2, 1):
+            if i + length <= len(digits):
+                value = int(digits[i:i + length])
+                if 1 <= value <= 34 and value in ELV_N2SYM:
+                    rest = dfs(i + length)
+                    if rest is not None:
+                        memo[i] = [ELV_N2SYM[value]] + rest
+                        return memo[i]
+
+        memo[i] = None
+        return None
+
+    symbols = dfs(0)
+    if symbols is None:
+        return None
+
+    return "".join(symbols)                                                    # simply concatenate
+
+
+# ------------------------------------------------------------------
+#  Core dataclass – used for section extraction
+# ------------------------------------------------------------------
+@dataclass
+class Section:
+    title: str
+    body: str
+
+
+# ------------------------------------------------------------------
+#  .docx → text
+# ------------------------------------------------------------------
+def docxToText(docxPath: str | Path) -> str:
+    """
+    Extract raw text from a .docx file without external libraries.
+    Collects all <w:t> elements from “word/document.xml”.
+    """
+    docxPath = Path(docxPath)
+    if not docxPath.is_file():
+        raise FileNotFoundError(docxPath)
+
+    with zipfile.ZipFile(docxPath) as zf:
+        xmlBytes = zf.read("word/document.xml")
+    root = ET.fromstring(xmlBytes)
+
+    # Word namespace helper
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+
+    texts = [node.text for node in root.findall(".//w:t", ns) if node.text]
+    return " ".join(texts)
+
+
+# ------------------------------------------------------------------
+#  Section splitter (very lightweight heuristics)
+# ------------------------------------------------------------------
+_HEADING_RE = re.compile(r"^[A-Z0-9 ,.'\"/:()\-]{1,60}$")
+
+
+def splitSections(rawText: str) -> List[Section]:
+    """
+    Split text into sections based on simple heading heuristics:
+    – A line considered a heading when fully upper-case and not too long.
+    """
+    lines = rawText.splitlines()
+    sections: List[Section] = []
+
+    currentTitle = "ROOT"
+    currentBody: List[str] = []
+
+    def _flush() -> None:
+        bodyText = " ".join(line.strip() for line in currentBody).strip()
+        sections.append(Section(currentTitle, bodyText))
+
+    for line in lines:
+        if _HEADING_RE.match(line.strip()):
+            _flush()
+            currentTitle = line.strip()
+            currentBody = []
+        else:
+            currentBody.append(line)
+
+    _flush()
+    return sections
+
+
+# ------------------------------------------------------------------
+#  Numeric sequence extraction & decoding
+# ------------------------------------------------------------------
+_DIGIT_SEQ_RE = re.compile(r"\d{2,}")   # at least two consecutive digits
+
+
+def decodeAllNumericSequences(text: str) -> List[Dict[str, Optional[str]]]:
+    """Find every digit string and attempt both cipher decodes."""
+    outputs: List[Dict[str, Optional[str]]] = []
+    seen: set[str] = set()
+
+    for match in _DIGIT_SEQ_RE.finditer(text):
+        seq = match.group(0)
+        if seq in seen:
+            continue
+        seen.add(seq)
+
+        outputs.append(
+            {
+                "sequence": seq,
+                "english": decodeEnglishA1Z26Concat(seq),
+                "elveirdor": decodeElveirdorConcat(seq),
+            }
+        )
+
+    return outputs
+
+
+# ------------------------------------------------------------------
+#  Serialisation helpers
+# ------------------------------------------------------------------
+_OUTPUT_DIR = Path("elveirdor_outputs")
+
+
+def _ensureOutputDir() -> None:
+    _OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _writeSectionsJson(sections: List[Section]) -> None:
+    _ensureOutputDir()
+    outPath = _OUTPUT_DIR / "sections.json"
+    with outPath.open("w", encoding="utf-8") as f:
+        json.dump([asdict(s) for s in sections], f, ensure_ascii=False, indent=2)
+
+
+def _writeDecodedJsonCsv(rows: List[Dict[str, Optional[str]]]) -> None:
+    _ensureOutputDir()
+
+    jsonPath = _OUTPUT_DIR / "decoded_sequences.json"
+    with jsonPath.open("w", encoding="utf-8") as fJson:
+        json.dump(rows, fJson, ensure_ascii=False, indent=2)
+
+    csvPath = _OUTPUT_DIR / "decoded_sequences.csv"
+    with csvPath.open("w", encoding="utf-8", newline="") as fCsv:
+        writer = csv.DictWriter(fCsv, fieldnames=["sequence", "english", "elveirdor"])
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+# ------------------------------------------------------------------
+#  CLI entry-point
+# ------------------------------------------------------------------
+def _cli() -> None:
+    if len(sys.argv) != 2:
+        print("Usage: python elveirdor_toolkit.py /path/to/file.docx", file=sys.stderr)
+        sys.exit(1)
+
+    docxPath = Path(sys.argv[1])
+    print(f"Reading  : {docxPath}")
+    rawText = docxToText(docxPath)
+
+    print("Splitting sections…")
+    sections = splitSections(rawText)
+    _writeSectionsJson(sections)
+    print(f"  → {_OUTPUT_DIR / 'sections.json'}  ({len(sections)} sections)")
+
+    print("Searching numeric sequences & decoding…")
+    findings = decodeAllNumericSequences(rawText)
+    _writeDecodedJsonCsv(findings)
+    print(
+        f"  → {_OUTPUT_DIR / 'decoded_sequences.json'}\n"
+        f"  → {_OUTPUT_DIR / 'decoded_sequences.csv'}  ({len(findings)} sequences)"
+    )
+
+
+if __name__ == "__main__":
+    _cli()
+```

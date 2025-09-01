@@ -1,0 +1,261 @@
+Below is a self-contained “Elveirdor Toolkit” script that fulfils everything outlined in the description:
+
+• English A1-Z26 and Elveirdor Ichthys encoders/decoders  
+• .docx → plain-text extractor (pure standard library)  
+• Simple section splitter  
+• Numeric sequence finder + dual-cipher decoding  
+• JSON/CSV export under elveirdor_outputs/  
+• Can be imported as a library or executed from the command line
+
+Copy the file somewhere as elveirdor_toolkit.py and run:
+
+    python elveirdor_toolkit.py "/path/to/file.docx"
+
+or use the individual functions in your own code.
+
+```python
+# elveirdor_toolkit.py
+# Made by Developer AI
+
+from __future__ import annotations
+import re
+import csv
+import json
+import sys
+import zipfile
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from typing import List, Dict, Optional
+
+# ---------------------------------------------------------------------------
+# 1. Cipher tables
+# ---------------------------------------------------------------------------
+
+ENG_L2N = {chr(ord('A') + i): i + 1 for i in range(26)}
+ENG_N2L = {v: k for k, v in ENG_L2N.items()}
+
+ELV_TOKENS = [               # digraph tokens
+    ("CH", 4), ("CK", 5), ("LL", 16),
+    ("PH", 21), ("ST", 25), ("TH", 27), ("WH", 31)
+]
+
+ELV_L2N = {                  # single-symbol tokens
+    "A": 1,  "B": 2,  "C": 3,
+    "D": 6,  "E": 7,  "EE": 8,
+    "F": 9,  "G": 10, "H": 11, "I": 12,
+    "J": 13, "K": 14, "L": 15,
+    "M": 17, "N": 18, "O": 19, "P": 20,
+    "Q": 22, "R": 23, "S": 24,
+    "T": 26, "U": 28, "V": 29, "W": 30,
+    "X": 32, "Y": 33, "Z": 34,
+}
+
+# build lookup tables
+ELV_TOKEN_ORDER: List[str] = [t for t, _ in ELV_TOKENS] + list(ELV_L2N.keys())
+ELV_TOKEN_ORDER.sort(key=len, reverse=True)                 # longest first
+ELV_N2SYM = {n: s for s, n in (ELV_TOKENS + list(ELV_L2N.items()))}
+
+# ---------------------------------------------------------------------------
+# 2. Cipher helpers
+# ---------------------------------------------------------------------------
+
+def encode_english_a1z26(text: str) -> List[int]:
+    return [ENG_L2N[ch] for ch in text.upper() if ch.isalpha()]
+
+def decode_english_a1z26_concat(nums: str) -> Optional[str]:
+    nums = nums.lstrip("0")  # ignore leading zeros
+    if not nums.isdigit():
+        return None
+
+    memo: Dict[int, Optional[str]] = {}
+
+    def dfs(i: int) -> Optional[str]:
+        if i == len(nums):
+            return ""
+        if i in memo:
+            return memo[i]
+        for ln in (2, 1):                        # try 2-digit first
+            if i + ln <= len(nums):
+                val = int(nums[i:i+ln])
+                if 1 <= val <= 26:
+                    rest = dfs(i + ln)
+                    if rest is not None:
+                        memo[i] = ENG_N2L[val] + rest
+                        return memo[i]
+        memo[i] = None
+        return None
+
+    return dfs(0)
+
+def _tokenize_elv(text: str) -> List[str]:
+    s = re.sub(r"[^A-Za-z]", "", text.upper())
+    out, i = [], 0
+    while i < len(s):
+        for tok in ELV_TOKEN_ORDER:
+            if s.startswith(tok, i):
+                out.append(tok)
+                i += len(tok)
+                break
+        else:
+            i += 1                                # unknown symbol, skip
+    return out
+
+def encode_elveirdor(text: str) -> List[int]:
+    nums: List[int] = []
+    for tok in _tokenize_elv(text):
+        nums.append(ELV_L2N.get(tok) or dict(ELV_TOKENS).get(tok))
+    return nums
+
+def decode_elveirdor_concat(nums: str) -> Optional[str]:
+    nums = nums.lstrip("0")
+    if not nums.isdigit():
+        return None
+
+    memo: Dict[int, Optional[List[str]]] = {}
+
+    def dfs(i: int) -> Optional[List[str]]:
+        if i == len(nums):
+            return []
+        if i in memo:
+            return memo[i]
+        for ln in (2, 1):
+            if i + ln <= len(nums):
+                val = int(nums[i:i+ln])
+                if 1 <= val <= 34 and val in ELV_N2SYM:
+                    rest = dfs(i + ln)
+                    if rest is not None:
+                        memo[i] = [ELV_N2SYM[val]] + rest
+                        return memo[i]
+        memo[i] = None
+        return None
+
+    syms = dfs(0)
+    if syms is None:
+        return None
+    # collapse tokens into plain text (keep digraphs as-is)
+    return "".join(syms)
+
+# ---------------------------------------------------------------------------
+# 3. .docx → plain text (no third-party libs)
+# ---------------------------------------------------------------------------
+
+def docx_to_text(docx_path: str | Path) -> str:
+    docx_path = Path(docx_path)
+    if not docx_path.exists():
+        raise FileNotFoundError(docx_path)
+    with zipfile.ZipFile(docx_path) as z:
+        xml_data = z.read("word/document.xml")
+    root = ET.fromstring(xml_data)
+
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    texts = [node.text
+             for node in root.iterfind(".//w:t", ns)
+             if node.text]
+    return " ".join(texts)
+
+# ---------------------------------------------------------------------------
+# 4. Simple section splitter
+# ---------------------------------------------------------------------------
+
+def split_sections(text: str) -> List[Dict[str, str]]:
+    """
+    Very naive splitter:
+    any line that is UPPER-CASE and 3+ chars long is treated as new heading.
+    """
+    sections: List[Dict[str, str]] = []
+    current_title, current_body = "ROOT", []
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if (stripped.isupper() and len(stripped) >= 3) or stripped.endswith(":"):
+            # flush old
+            if current_body:
+                sections.append({"title": current_title,
+                                 "body": " ".join(current_body).strip()})
+            current_title = stripped.rstrip(":")
+            current_body = []
+        else:
+            if stripped:
+                current_body.append(stripped)
+
+    if current_body:
+        sections.append({"title": current_title,
+                         "body": " ".join(current_body).strip()})
+    return sections
+
+# ---------------------------------------------------------------------------
+# 5. Numeric sequence extraction & decoding
+# ---------------------------------------------------------------------------
+
+_digit_re = re.compile(r"\d{2,}")   # ≥2 consecutive digits
+
+def extract_numeric_sequences(text: str) -> List[str]:
+    return list(dict.fromkeys(_digit_re.findall(text)))      # unique, keep order
+
+def decode_all_numeric_sequences(text: str) -> List[Dict[str, Optional[str]]]:
+    results: List[Dict[str, Optional[str]]] = []
+    for seq in extract_numeric_sequences(text):
+        results.append({
+            "sequence": seq,
+            "english": decode_english_a1z26_concat(seq),
+            "elveirdor": decode_elveirdor_concat(seq),
+        })
+    return results
+
+# ---------------------------------------------------------------------------
+# 6. Persistence helpers
+# ---------------------------------------------------------------------------
+
+OUT_DIR = Path("elveirdor_outputs")
+OUT_DIR.mkdir(exist_ok=True)
+
+def save_json(obj, filename: str):
+    with open(OUT_DIR / filename, "w", encoding="utf-8") as fh:
+        json.dump(obj, fh, ensure_ascii=False, indent=2)
+
+def save_csv(rows: List[Dict[str, str | None]], filename: str):
+    if not rows:
+        return
+    with open(OUT_DIR / filename, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+
+# ---------------------------------------------------------------------------
+# 7. CLI
+# ---------------------------------------------------------------------------
+
+def _cli() -> None:
+    if len(sys.argv) != 2:
+        print("Usage: python elveirdor_toolkit.py /path/to/file.docx")
+        sys.exit(1)
+
+    docx_file = Path(sys.argv[1])
+    print(f"Reading {docx_file} ...")
+    text = docx_to_text(docx_file)
+
+    # sections
+    sections = split_sections(text)
+    save_json(sections, "sections.json")
+    print(f"Extracted {len(sections)} section(s)")
+
+    # numeric decoding
+    decoded = decode_all_numeric_sequences(text)
+    save_json(decoded, "decoded_sequences.json")
+    save_csv(decoded, "decoded_sequences.csv")
+    print(f"Processed {len(decoded)} numeric sequence(s)")
+    print(f"Artifacts written to {OUT_DIR / '*'}")
+
+if __name__ == "__main__":
+    _cli()
+```
+
+Key implementation notes
+• The .docx reader only relies on the document.xml part inside the OOXML zip container, thus stays 100 % standard library.  
+• Decoders treat the digit run as a *concatenated* stream with back-tracking; leading zeros are ignored so sequences like 000080 are recognised as invalid.  
+• Section splitting is intentionally simple—you can replace it with smarter heuristics if required.  
+• All outputs go to `elveirdor_outputs/` (which is created automatically) as specified:  
+  – decoded_sequences.json / decoded_sequences.csv  
+  – sections.json  
+
+Feel free to extend or adjust any component to suit your workflow.
